@@ -8,4 +8,4 @@
 3- Virtual environment running command on Linux
 `source env/bin/activate`
 4- Run the code
-`python monitor.py`
+`python main.py`

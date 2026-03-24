@@ -3,7 +3,7 @@ import time
 import statistics
 import locale
 
-def check_jitter(host="192.168.88.1", count=10):
+def check_jitter(host="192.168.1.1", count=10):
     latencies = []
     for _ in range(count):
         cmd = ["ping", "-n", "1", host] # -c 1 sur Linux

@@ -4,6 +4,8 @@ import subprocess
 import re
 import os
 import csv
+import statistics
+from datetime import datetime
 from collections import deque
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -11,16 +13,15 @@ import psutil
 import uvicorn
 
 app = FastAPI()
-# On augmente à 300 pour garder 5 minutes de contexte en RAM
 stats_history = deque(maxlen=300)
-GATEWAY = "192.168.88.1" 
+latency_samples = deque(maxlen=20) # Pour le calcul du Jitter
+GATEWAY = "192.168.1.1" 
 CSV_FILE = "network_stats_history.csv"
 
-# --- INITIALISATION CSV (Data Science) ---
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Download_KBps", "Upload_KBps", "Ping_ms", "Status"])
+        writer.writerow(["Timestamp", "Download_KBps", "Upload_KBps", "Ping_ms", "Jitter_ms", "Status"])
 
 def get_active_interface():
     addrs = psutil.net_io_counters(pernic=True)
@@ -43,26 +44,35 @@ def get_ping(host):
     except Exception:
         return 999
 
-def get_status(ms):
-    if ms < 20: return "OPTIMAL (Direct)", "#2ecc71"
-    if ms < 80: return "MOYEN (Congestion)", "#f39c12"
-    return "MAUVAIS (Saturation/NAT)", "#e74c3c"
+def get_network_analysis(ms, jitter):
+    """Analyse intelligente de la qualité IGGLIA"""
+    if ms > 250 or jitter > 80:
+        return "CRITIQUE (Saturation)", "#e74c3c"
+    if ms > 100 or jitter > 40:
+        return "CONGESTION (Dépriorisation)", "#f39c12"
+    return "STABLE (Normal)", "#2ecc71"
+
+def check_monthly_cycle():
+    """Prédit le retour à la normale selon le jour du mois"""
+    day = datetime.now().day
+    if day >= 25:
+        return "⚠️ Fin de mois : Risque de bridage quota élevé."
+    if day <= 5:
+        return "✅ Début de mois : Rétablissement des services."
+    return "Cycle standard en cours..."
 
 def save_to_csv(entry):
-    """Sauvegarde persistante d'une ligne de donnée"""
     try:
         with open(CSV_FILE, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([entry['time'], entry['down'], entry['up'], entry['ping'], entry['status']])
+            writer.writerow([entry['time'], entry['down'], entry['up'], entry['ping'], entry['jitter'], entry['status']])
     except Exception as e:
-        print(f"Erreur d'écriture CSV : {e}")
+        print(f"Erreur CSV : {e}")
 
-# --- BACKEND ROBUSTE (Gestion crash silencieux) ---
 def network_worker():
-    print(f"[*] Diagnostic dynamique lancé sur : {INTERFACE}")
+    print(f"[*] Monitoring avancé lancé sur : {INTERFACE}")
     last_csv_save = time.time()
     
-    # Initialisation sécurisée des compteurs
     try:
         old_stats = psutil.net_io_counters(pernic=True).get(INTERFACE, psutil.net_io_counters())
         old_recv, old_sent = old_stats.bytes_recv, old_stats.bytes_sent
@@ -72,29 +82,35 @@ def network_worker():
     while True:
         try:
             time.sleep(1)
-            # Vérification de l'existence de l'interface (évite le crash si on coupe le Wi-Fi)
             current_all_stats = psutil.net_io_counters(pernic=True)
-            if INTERFACE not in current_all_stats:
-                continue 
+            if INTERFACE not in current_all_stats: continue 
                 
             new_stats = current_all_stats[INTERFACE]
             down = (new_stats.bytes_recv - old_recv) / 1024
             up = (new_stats.bytes_sent - old_sent) / 1024
+            
             latency = get_ping(GATEWAY)
-            status_text, status_color = get_status(latency)
+            latency_samples.append(latency)
+            
+            # Calcul du Jitter (Écart-type des 20 derniers pings)
+            jitter = round(statistics.stdev(latency_samples), 2) if len(latency_samples) > 1 else 0
+            
+            status_text, status_color = get_network_analysis(latency, jitter)
+            cycle_msg = check_monthly_cycle()
             
             data_entry = {
-                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "down": round(down, 2),
                 "up": round(up, 2),
                 "ping": latency,
+                "jitter": jitter,
                 "status": status_text,
-                "color": status_color
+                "color": status_color,
+                "cycle": cycle_msg
             }
             
             stats_history.append(data_entry)
             
-            # Sauvegarde persistante toutes les 5 secondes (ajustable)
             if time.time() - last_csv_save > 5:
                 save_to_csv(data_entry)
                 last_csv_save = time.time()
@@ -102,8 +118,7 @@ def network_worker():
             old_recv, old_sent = new_stats.bytes_recv, new_stats.bytes_sent
             
         except Exception as e:
-            # Le "Anti-Crash" : On print l'erreur mais on ne casse pas la boucle
-            print(f"[!] Erreur de monitoring (récupération en cours...) : {e}")
+            print(f"Erreur Worker : {e}")
             time.sleep(2)
 
 @app.on_event("startup")
@@ -119,71 +134,56 @@ async def index(request: Request):
     return """
     <html>
         <head>
-            <title>Dynamic Monitor PRO</title>
+            <title>Starlink Monitor PRO - IGGLIA</title>
             <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
             <style>
                 body { font-family: 'Segoe UI', sans-serif; background: #0b0e14; color: #e0e0e0; padding: 20px; }
                 .card { background: #151921; border-radius: 12px; padding: 20px; max-width: 950px; margin: auto; border: 1px solid #232933; }
-                .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 20px 0; }
+                .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }
                 .box { background: #1c222d; padding: 15px; border-radius: 8px; text-align: center; border-bottom: 3px solid #2ecc71; }
-                .val { font-size: 22px; font-weight: bold; color: #fff; display: block; }
-                .unit { font-size: 13px; color: #888; margin-left: 4px; }
-                .lbl { font-size: 11px; text-transform: uppercase; color: #5c6370; letter-spacing: 1px; }
-                #badge { font-size: 12px; padding: 3px 10px; border-radius: 12px; display: inline-block; margin-top: 8px; }
-                #location-display { font-size: 13px; color: #4ecca3; margin-top: 5px; font-weight: bold; }
+                .val { font-size: 20px; font-weight: bold; color: #fff; display: block; }
+                .lbl { font-size: 10px; text-transform: uppercase; color: #5c6370; letter-spacing: 1px; }
+                #cycle-info { background: #1a202c; padding: 10px; border-radius: 6px; font-size: 13px; color: #4db8ff; margin-bottom: 15px; text-align: center; border: 1px solid #2d3748; }
+                #badge { font-size: 11px; padding: 3px 8px; border-radius: 10px; margin-top: 5px; display: inline-block; }
             </style>
         </head>
         <body>
             <div class="card">
+                <div id="cycle-info">Analyse du cycle mensuel en cours...</div>
                 <div style="text-align:center">
-                    <h2 style="margin:0">Monitoring Réseau Dynamique</h2>
-                    <div id="location-display">📍 Recherche de localisation...</div>
+                    <h2 style="margin:0">Diagnostic Starlink Madagascar</h2>
+                    <div id="location-display" style="font-size:12px; color:#4ecca3">Localisation...</div>
                 </div>
                 
                 <div class="grid">
                     <div class="box" style="border-color: #4ecca3">
                         <span class="lbl">Download</span>
-                        <div><span class="val" id="d-val">0</span><span class="unit" id="d-unit">Ko/s</span></div>
-                    </div>
-                    <div class="box" style="border-color: #45b7d1">
-                        <span class="lbl">Upload</span>
-                        <div><span class="val" id="u-val">0</span><span class="unit" id="u-unit">Ko/s</span></div>
+                        <span class="val" id="d-val">0</span><span id="d-unit" style="font-size:10px">Ko/s</span>
                     </div>
                     <div class="box" style="border-color: #f39c12">
                         <span class="lbl">Latence</span>
-                        <div><span class="val" id="p-val">0</span><span class="unit">ms</span></div>
-                        <div id="badge">Diagnostic...</div>
+                        <span class="val" id="p-val">0</span><span style="font-size:10px">ms</span>
+                    </div>
+                    <div class="box" style="border-color: #e74c3c">
+                        <span class="lbl">Jitter (Stabilité)</span>
+                        <span class="val" id="j-val">0</span><span style="font-size:10px">ms</span>
+                    </div>
+                    <div class="box" style="border-color: #45b7d1">
+                        <span class="lbl">Qualité</span>
+                        <div id="badge">Analyse...</div>
                     </div>
                 </div>
-
-                <canvas id="chart" height="140"></canvas>
+                <canvas id="chart" height="120"></canvas>
             </div>
 
             <script>
-                // --- SÉCURITÉ FRONTEND & LOCALISATION ---
                 async function updateLocation() {
                     const locEl = document.getElementById('location-display');
-                    if (navigator.geolocation) {
-                        navigator.geolocation.getCurrentPosition(async (pos) => {
-                            const { latitude, longitude } = pos.coords;
-                            try {
-                                // AJOUT SÉCURITÉ : Identification User-Agent pour éviter le blocage Nominatim
-                                const response = await fetch(
-                                    `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}`,
-                                    { headers: { 'User-Agent': 'NetworkMonitorApp/1.0' } }
-                                );
-                                const data = await response.json();
-                                const city = data.address.city || data.address.town || data.address.village || "Antananarivo";
-                                locEl.innerText = "📍 " + city + ", Madagascar";
-                            } catch (error) {
-                                locEl.innerText = "📍 Erreur de service Localisation";
-                            }
-                        }, (err) => {
-                            locEl.innerText = "📍 Accès localisation refusé ou indisponible";
-                        }, { timeout: 5000 }); // Sécurité : Timeout si le GPS ne répond pas
-                    } else {
-                        locEl.innerText = "📍 Géolocalisation non supportée";
-                    }
+                    navigator.geolocation.getCurrentPosition(async (pos) => {
+                        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${pos.coords.latitude}&lon=${pos.coords.longitude}`, {headers:{'User-Agent':'Monitor'}});
+                        const data = await response.json();
+                        locEl.innerText = "📍 " + (data.address.city || "Madagascar");
+                    });
                 }
                 updateLocation();
 
@@ -191,52 +191,32 @@ async def index(request: Request):
                 const chart = new Chart(ctx, {
                     type: 'line',
                     data: { labels: [], datasets: [
-                        { label: 'Download', data: [], borderColor: '#4ecca3', tension: 0.3, fill: true, backgroundColor: 'rgba(78,204,163,0.05)' },
-                        { label: 'Ping', data: [], borderColor: '#e74c3c', yAxisID: 'y1', borderDash: [3,3] }
+                        { label: 'Download', data: [], borderColor: '#4ecca3', tension: 0.3, yAxisID: 'y' },
+                        { label: 'Jitter', data: [], borderColor: '#e74c3c', yAxisID: 'y1', borderDash: [2,2] }
                     ]},
-                    options: { 
-                        scales: { 
-                            y: { grid: {color:'#232933'}, ticks: {color:'#5c6370'} },
-                            y1: { position: 'right', grid: {display:false}, ticks: {color:'#e74c3c'} }
-                        },
-                        plugins: { legend: { display: false } }
-                    }
+                    options: { scales: { y: { display: true }, y1: { position: 'right', display: true } }, plugins: { legend: { display: false } } }
                 });
 
-                function updateDisplay(value, valId, unitId) {
-                    const valEl = document.getElementById(valId);
-                    const unitEl = document.getElementById(unitId);
-                    if (value >= 1024) {
-                        valEl.innerText = (value / 1024).toFixed(2);
-                        unitEl.innerText = "Mo/s";
-                        valEl.style.color = "#FFD700"; 
-                    } else {
-                        valEl.innerText = value.toFixed(1);
-                        unitEl.innerText = "Ko/s";
-                        valEl.style.color = "#fff";
-                    }
-                }
-
                 async function refresh() {
-                    try {
-                        const r = await fetch('/api/stats');
-                        const data = await r.json();
-                        if(data.length > 0) {
-                            const last = data[data.length - 1];
-                            updateDisplay(last.down, 'd-val', 'd-unit');
-                            updateDisplay(last.up, 'u-val', 'u-unit');
-                            document.getElementById('p-val').innerText = last.ping;
-                            const b = document.getElementById('badge');
-                            b.innerText = last.status;
-                            b.style.backgroundColor = last.color;
+                    const r = await fetch('/api/stats');
+                    const data = await r.json();
+                    if(data.length > 0) {
+                        const last = data[data.length - 1];
+                        document.getElementById('d-val').innerText = last.down > 1024 ? (last.down/1024).toFixed(2) : last.down;
+                        document.getElementById('d-unit').innerText = last.down > 1024 ? " Mo/s" : " Ko/s";
+                        document.getElementById('p-val').innerText = last.ping;
+                        document.getElementById('j-val').innerText = last.jitter;
+                        document.getElementById('cycle-info').innerText = last.cycle;
+                        
+                        const b = document.getElementById('badge');
+                        b.innerText = last.status;
+                        b.style.backgroundColor = last.color;
 
-                            // Affichage uniquement de l'heure (HH:mm:ss) sur le graphe
-                            chart.data.labels = data.map(d => d.time.split(' ')[1]);
-                            chart.data.datasets[0].data = data.map(d => d.down);
-                            chart.data.datasets[1].data = data.map(d => d.ping);
-                            chart.update('none');
-                        }
-                    } catch(e) { console.log("Serveur injoignable..."); }
+                        chart.data.labels = data.map(d => d.time.split(' ')[1]);
+                        chart.data.datasets[0].data = data.map(d => d.down);
+                        chart.data.datasets[1].data = data.map(d => d.jitter);
+                        chart.update('none');
+                    }
                 }
                 setInterval(refresh, 1000);
             </script>
