@@ -14,14 +14,14 @@ import uvicorn
 
 app = FastAPI()
 stats_history = deque(maxlen=300)
-latency_samples = deque(maxlen=20) # Pour le calcul du Jitter
+latency_samples = deque(maxlen=20) 
 GATEWAY = "192.168.1.1" 
 CSV_FILE = "network_stats_history.csv"
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Download_KBps", "Upload_KBps", "Ping_ms", "Jitter_ms", "Status"])
+        writer.writerow(["Timestamp", "Download_KBps", "Upload_KBps", "Ping_ms", "Jitter_ms", "Loss", "Status"])
 
 def get_active_interface():
     addrs = psutil.net_io_counters(pernic=True)
@@ -36,24 +36,26 @@ def get_active_interface():
 
 INTERFACE = get_active_interface()
 
-def get_ping(host):
+def get_ping_with_loss(host):
+    """Reprend ta logique de regex originale (\d+)\s*ms pour éviter le 999ms constant"""
     try:
         output = subprocess.check_output(f"ping -n 1 -w 500 {host}", shell=True).decode('cp850', errors='ignore')
         match = re.search(r"(\d+)\s*ms", output)
-        return int(match.group(1)) if match else 999
+        if match:
+            return int(match.group(1)), 0  # Ping trouvé, 0% perte
+        return 999, 100 # Pas de match, 100% perte
     except Exception:
-        return 999
+        return 999, 100
 
-def get_network_analysis(ms, jitter):
-    """Analyse intelligente de la qualité IGGLIA"""
-    if ms > 250 or jitter > 80:
+def get_network_analysis(ms, jitter, loss):
+    """Ton analyse originale avec prise en compte de la perte pour l'alignement"""
+    if loss > 0 or ms > 250 or jitter > 80:
         return "CRITIQUE (Saturation)", "#e74c3c"
     if ms > 100 or jitter > 40:
         return "CONGESTION (Dépriorisation)", "#f39c12"
     return "STABLE (Normal)", "#2ecc71"
 
 def check_monthly_cycle():
-    """Prédit le retour à la normale selon le jour du mois"""
     day = datetime.now().day
     if day >= 25:
         return "⚠️ Fin de mois : Risque de bridage quota élevé."
@@ -65,12 +67,12 @@ def save_to_csv(entry):
     try:
         with open(CSV_FILE, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([entry['time'], entry['down'], entry['up'], entry['ping'], entry['jitter'], entry['status']])
+            writer.writerow([entry['time'], entry['down'], entry['up'], entry['ping'], entry['jitter'], entry['loss'], entry['status']])
     except Exception as e:
         print(f"Erreur CSV : {e}")
 
 def network_worker():
-    print(f"[*] Monitoring avancé lancé sur : {INTERFACE}")
+    print(f"[*] Monitoring avec outil d'alignement sur : {INTERFACE}")
     last_csv_save = time.time()
     
     try:
@@ -89,13 +91,11 @@ def network_worker():
             down = (new_stats.bytes_recv - old_recv) / 1024
             up = (new_stats.bytes_sent - old_sent) / 1024
             
-            latency = get_ping(GATEWAY)
+            latency, loss = get_ping_with_loss(GATEWAY)
             latency_samples.append(latency)
-            
-            # Calcul du Jitter (Écart-type des 20 derniers pings)
             jitter = round(statistics.stdev(latency_samples), 2) if len(latency_samples) > 1 else 0
             
-            status_text, status_color = get_network_analysis(latency, jitter)
+            status_text, status_color = get_network_analysis(latency, jitter, loss)
             cycle_msg = check_monthly_cycle()
             
             data_entry = {
@@ -104,6 +104,7 @@ def network_worker():
                 "up": round(up, 2),
                 "ping": latency,
                 "jitter": jitter,
+                "loss": loss,
                 "status": status_text,
                 "color": status_color,
                 "cycle": cycle_msg
@@ -134,7 +135,7 @@ async def index(request: Request):
     return """
     <html>
         <head>
-            <title>Starlink Monitor PRO - IGGLIA</title>
+            <title>Starlink Monitor PRO</title>
             <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
             <style>
                 body { font-family: 'Segoe UI', sans-serif; background: #0b0e14; color: #e0e0e0; padding: 20px; }
@@ -165,8 +166,8 @@ async def index(request: Request):
                         <span class="val" id="p-val">0</span><span style="font-size:10px">ms</span>
                     </div>
                     <div class="box" style="border-color: #e74c3c">
-                        <span class="lbl">Jitter (Stabilité)</span>
-                        <span class="val" id="j-val">0</span><span style="font-size:10px">ms</span>
+                        <span class="lbl">Perte / Jitter</span>
+                        <span class="val"><span id="l-val" style="color:#e74c3c">0%</span> / <span id="j-val" style="font-size:14px">0</span>ms</span>
                     </div>
                     <div class="box" style="border-color: #45b7d1">
                         <span class="lbl">Qualité</span>
@@ -180,9 +181,11 @@ async def index(request: Request):
                 async function updateLocation() {
                     const locEl = document.getElementById('location-display');
                     navigator.geolocation.getCurrentPosition(async (pos) => {
-                        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${pos.coords.latitude}&lon=${pos.coords.longitude}`, {headers:{'User-Agent':'Monitor'}});
-                        const data = await response.json();
-                        locEl.innerText = "📍 " + (data.address.city || "Madagascar");
+                        try {
+                            const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${pos.coords.latitude}&lon=${pos.coords.longitude}`, {headers:{'User-Agent':'Monitor'}});
+                            const data = await response.json();
+                            locEl.innerText = "📍 " + (data.address.city || "Madagascar");
+                        } catch(e) { locEl.innerText = "📍 Madagascar"; }
                     });
                 }
                 updateLocation();
@@ -206,6 +209,7 @@ async def index(request: Request):
                         document.getElementById('d-unit').innerText = last.down > 1024 ? " Mo/s" : " Ko/s";
                         document.getElementById('p-val').innerText = last.ping;
                         document.getElementById('j-val').innerText = last.jitter;
+                        document.getElementById('l-val').innerText = last.loss + "%";
                         document.getElementById('cycle-info').innerText = last.cycle;
                         
                         const b = document.getElementById('badge');
